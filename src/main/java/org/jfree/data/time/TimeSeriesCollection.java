@@ -69,8 +69,11 @@ public class TimeSeriesCollection<S extends Comparable<S>>
     /** Storage for the time series. */
     private List<TimeSeries<S>> data;
 
-    /** A working calendar (to recycle) */
-    private Calendar workingCalendar;
+    /** Map for fast O(1) series lookup by key. */
+    private Map<S, TimeSeries<S>> seriesMap;
+
+    /** A working calendar (to recycle) - using ThreadLocal for thread safety */
+    private final ThreadLocal<Calendar> workingCalendar;
 
     /**
      * The point within each time period that is used for the X value when this
@@ -78,6 +81,12 @@ public class TimeSeriesCollection<S extends Comparable<S>>
      * be the start, middle or end of the time period.
      */
     private TimePeriodAnchor xPosition;
+
+    /** Cached domain bounds to avoid recalculation. */
+    private Range cachedDomainBounds;
+    private boolean cachedDomainBoundsIncludeInterval;
+    private long cachedDomainBoundsVersion;
+    private long dataVersion;
 
     /**
      * Constructs an empty dataset, tied to the default timezone.
@@ -122,10 +131,17 @@ public class TimeSeriesCollection<S extends Comparable<S>>
         if (zone == null) {
             zone = TimeZone.getDefault();
         }
-        this.workingCalendar = Calendar.getInstance(zone);
+        final TimeZone finalZone = zone;
+        this.workingCalendar = ThreadLocal.withInitial(() -> Calendar.getInstance(finalZone));
         this.data = new ArrayList<>();
+        this.seriesMap = new HashMap<>();
+        this.cachedDomainBounds = null;
+        this.cachedDomainBoundsIncludeInterval = false;
+        this.cachedDomainBoundsVersion = 0;
+        this.dataVersion = 0;
         if (series != null) {
             this.data.add(series);
+            this.seriesMap.put(series.getKey(), series);
             series.addChangeListener(this);
         }
         this.xPosition = TimePeriodAnchor.START;
@@ -162,6 +178,7 @@ public class TimeSeriesCollection<S extends Comparable<S>>
     public void setXPosition(TimePeriodAnchor anchor) {
         Args.nullNotPermitted(anchor, "anchor");
         this.xPosition = anchor;
+        this.dataVersion++;
         notifyListeners(new DatasetChangeEvent(this, this));
     }
 
@@ -220,12 +237,10 @@ public class TimeSeriesCollection<S extends Comparable<S>>
      * @return The series with the given key.
      */
     public TimeSeries<S> getSeries(S key) {
-        for (TimeSeries series : this.data) {
-            if (series.getKey() != null && series.getKey().equals(key)) {
-                return series;
-            }
+        if (key == null) {
+            return null;
         }
-        return null;
+        return this.seriesMap.get(key);
     }
 
     /**
@@ -254,12 +269,9 @@ public class TimeSeriesCollection<S extends Comparable<S>>
      */
     public int getSeriesIndex(S key) {
         Args.nullNotPermitted(key, "key");
-        int seriesCount = getSeriesCount();
-        for (int i = 0; i < seriesCount; i++) {
-            TimeSeries<S> series = this.data.get(i);
-            if (key.equals(series.getKey())) {
-                return i;
-            }
+        TimeSeries<S> series = this.seriesMap.get(key);
+        if (series != null) {
+            return this.data.indexOf(series);
         }
         return -1;
     }
@@ -273,6 +285,8 @@ public class TimeSeriesCollection<S extends Comparable<S>>
     public void addSeries(TimeSeries<S> series) {
         Args.nullNotPermitted(series, "series");
         this.data.add(series);
+        this.seriesMap.put(series.getKey(), series);
+        this.dataVersion++;
         series.addChangeListener(this);
         fireDatasetChanged();
     }
@@ -286,6 +300,8 @@ public class TimeSeriesCollection<S extends Comparable<S>>
     public void removeSeries(TimeSeries<S> series) {
         Args.nullNotPermitted(series, "series");
         this.data.remove(series);
+        this.seriesMap.remove(series.getKey());
+        this.dataVersion++;
         series.removeChangeListener(this);
         fireDatasetChanged();
     }
@@ -316,6 +332,8 @@ public class TimeSeriesCollection<S extends Comparable<S>>
 
         // remove all the series from the collection and notify listeners.
         this.data.clear();
+        this.seriesMap.clear();
+        this.dataVersion++;
         fireDatasetChanged();
     }
 
@@ -369,16 +387,17 @@ public class TimeSeriesCollection<S extends Comparable<S>>
      *
      * @return The x-value.
      */
-    protected synchronized long getX(RegularTimePeriod period) {
+    protected long getX(RegularTimePeriod period) {
+        Calendar cal = this.workingCalendar.get();
         long result = 0L;
         if (this.xPosition == TimePeriodAnchor.START) {
-            result = period.getFirstMillisecond(this.workingCalendar);
+            result = period.getFirstMillisecond(cal);
         }
         else if (this.xPosition == TimePeriodAnchor.MIDDLE) {
-            result = period.getMiddleMillisecond(this.workingCalendar);
+            result = period.getMiddleMillisecond(cal);
         }
         else if (this.xPosition == TimePeriodAnchor.END) {
-            result = period.getLastMillisecond(this.workingCalendar);
+            result = period.getLastMillisecond(cal);
         }
         return result;
     }
@@ -392,9 +411,10 @@ public class TimeSeriesCollection<S extends Comparable<S>>
      * @return The value.
      */
     @Override
-    public synchronized Number getStartX(int series, int item) {
+    public Number getStartX(int series, int item) {
         TimeSeries<S> ts = this.data.get(series);
-        return ts.getTimePeriod(item).getFirstMillisecond(this.workingCalendar);
+        Calendar cal = this.workingCalendar.get();
+        return ts.getTimePeriod(item).getFirstMillisecond(cal);
     }
 
     /**
@@ -406,9 +426,10 @@ public class TimeSeriesCollection<S extends Comparable<S>>
      * @return The value.
      */
     @Override
-    public synchronized Number getEndX(int series, int item) {
+    public Number getEndX(int series, int item) {
         TimeSeries<S> ts = this.data.get(series);
-        return ts.getTimePeriod(item).getLastMillisecond(this.workingCalendar);
+        Calendar cal = this.workingCalendar.get();
+        return ts.getTimePeriod(item).getLastMillisecond(cal);
     }
 
     /**
@@ -525,7 +546,15 @@ public class TimeSeriesCollection<S extends Comparable<S>>
      */
     @Override
     public Range getDomainBounds(boolean includeInterval) {
+        // Use cached result if available and still valid
+        if (this.cachedDomainBounds != null 
+                && this.cachedDomainBoundsIncludeInterval == includeInterval
+                && this.cachedDomainBoundsVersion == this.dataVersion) {
+            return this.cachedDomainBounds;
+        }
+        
         Range result = null;
+        Calendar cal = this.workingCalendar.get();
         for (TimeSeries<S> series : this.data) {
             int count = series.getItemCount();
             if (count > 0) {
@@ -537,12 +566,18 @@ public class TimeSeriesCollection<S extends Comparable<S>>
                 }
                 else {
                     temp = new Range(
-                            start.getFirstMillisecond(this.workingCalendar),
-                            end.getLastMillisecond(this.workingCalendar));
+                            start.getFirstMillisecond(cal),
+                            end.getLastMillisecond(cal));
                 }
                 result = Range.combine(result, temp);
             }
         }
+        
+        // Cache the result
+        this.cachedDomainBounds = result;
+        this.cachedDomainBoundsIncludeInterval = includeInterval;
+        this.cachedDomainBoundsVersion = this.dataVersion;
+        
         return result;
     }
 
@@ -572,9 +607,10 @@ public class TimeSeriesCollection<S extends Comparable<S>>
                     temp = new Range(getX(start), getX(end));
                 }
                 else {
+                    Calendar cal = this.workingCalendar.get();
                     temp = new Range(
-                            start.getFirstMillisecond(this.workingCalendar),
-                            end.getLastMillisecond(this.workingCalendar));
+                            start.getFirstMillisecond(cal),
+                            end.getLastMillisecond(cal));
                 }
                 result = Range.combine(result, temp);
             }
@@ -618,8 +654,8 @@ public class TimeSeriesCollection<S extends Comparable<S>>
         for (Object visibleSeriesKey : visibleSeriesKeys) {
             Comparable seriesKey = (Comparable) visibleSeriesKey;
             TimeSeries<S> series = getSeries((S) seriesKey);
-            Range r = series.findValueRange(xRange, this.xPosition,
-                    this.workingCalendar);
+            Calendar cal = this.workingCalendar.get();
+            Range r = series.findValueRange(xRange, this.xPosition, cal);
             result = Range.combineIgnoringNaN(result, r);
         }
         return result;
@@ -690,8 +726,8 @@ public class TimeSeriesCollection<S extends Comparable<S>>
     public int hashCode() {
         int result;
         result = this.data.hashCode();
-        result = 29 * result + (this.workingCalendar != null
-                ? this.workingCalendar.hashCode() : 0);
+        result = 29 * result + (this.seriesMap != null
+                ? this.seriesMap.hashCode() : 0);
         result = 29 * result + (this.xPosition != null
                 ? this.xPosition.hashCode() : 0);
         return result;
@@ -709,7 +745,12 @@ public class TimeSeriesCollection<S extends Comparable<S>>
     public Object clone() throws CloneNotSupportedException {
         TimeSeriesCollection clone = (TimeSeriesCollection) super.clone();
         clone.data = CloneUtils.cloneList(this.data);
-        clone.workingCalendar = (Calendar) this.workingCalendar.clone();
+        clone.seriesMap = new HashMap<>(this.seriesMap);
+        // ThreadLocal will be initialized on first access
+        clone.cachedDomainBounds = null;
+        clone.cachedDomainBoundsIncludeInterval = false;
+        clone.cachedDomainBoundsVersion = 0;
+        clone.dataVersion = 0;
         return clone;
     }
 
